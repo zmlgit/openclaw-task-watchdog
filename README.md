@@ -47,6 +47,7 @@ All settings are optional. Configure via `openclaw.plugin.json` → `config`:
 | `execNotifyOnAbnormal` | `boolean` | `true` | Enable notifications on abnormal exec exits |
 | `injectionTtlMs` | `integer` | `300000` (5 min) | TTL for next-turn injection messages (5000–600000 ms) |
 | `timerPatrol` | `boolean` | `true` | Enable timer-based patrol on gateway start. When enabled, heartbeat patrol is skipped. |
+| `heartbeatPatrol` | `boolean` | `false` | Enable heartbeat-based patrol. Only effective when timerPatrol is disabled. |
 | `timerPatrolIntervalMs` | `integer` | `120000` (2 min) | Timer patrol interval (30000–600000 ms) |
 | `staleThresholdMs` | `integer` | `1800000` (30 min) | How long before a running task is considered stale (60000–7200000 ms) |
 
@@ -74,6 +75,23 @@ npx tsc
 # Build and watch
 npx tsc --watch
 ```
+
+## Changelog
+
+### v1.1.0 (2026-05-12)
+
+**Bug Fixes:**
+- 🔴 Fixed interval leak: idempotency map cleanup `setInterval` now properly cleared on `gateway_stop`
+- 🔴 Fixed `heartbeatPatrol` logic: clear mutual exclusion with `timerPatrol`, now works correctly when timer patrol is disabled
+- Added `heartbeatPatrol` to `configSchema` for discoverability
+
+**Improvements:**
+- 🟡 `injectionTtlMs` config now respected instead of hardcoded 60s TTL
+- 🟡 Added optional chaining on `api.runtime.system.*` calls for API version safety
+- 🟡 `reason` and `error` fields truncated to 200 chars to prevent oversized notifications
+- 🟡 `notifiedKeys` Map capped at 10,000 entries with oldest-half eviction
+- 🟡 `JSON.stringify` wrapped in try-catch for circular reference safety
+- All timer cleanup unified under single `gateway_stop` handler
 
 ## License
 

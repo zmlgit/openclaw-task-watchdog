@@ -13,6 +13,9 @@ type WatchdogConfig = {
   staleThresholdMs?: number;
 };
 
+/** Max entries in the idempotency map */
+const IDEMPOTENCY_MAX_SIZE = 10_000;
+
 export default definePluginEntry({
   id: "task-watchdog",
   name: "Task Watchdog",
@@ -30,10 +33,17 @@ export default definePluginEntry({
     const notifiedKeys = new Map<string, number>(); // key → timestamp
     const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-    setInterval(() => {
+    // Cleanup interval for expired idempotency keys — saved for gateway_stop
+    const idempotencyCleanupTimer = setInterval(() => {
       const now = Date.now();
       for (const [key, ts] of notifiedKeys) {
         if (now - ts > IDEMPOTENCY_TTL_MS) notifiedKeys.delete(key);
+      }
+      // Enforce max size: drop oldest half if over limit
+      if (notifiedKeys.size > IDEMPOTENCY_MAX_SIZE) {
+        const entries = [...notifiedKeys.entries()].sort((a, b) => a[1] - b[1]);
+        const cutCount = Math.floor(entries.length / 2);
+        for (let i = 0; i < cutCount; i++) notifiedKeys.delete(entries[i][0]);
       }
     }, 10 * 60 * 1000);
 
@@ -45,11 +55,22 @@ export default definePluginEntry({
       notifiedKeys.set(idempotencyKey, Date.now());
     }
 
+    // ── Utility: safe string truncation ────────────────────────────────
+    function truncate(str: string | undefined | null, maxLen: number): string {
+      if (!str) return "";
+      return str.length > maxLen ? str.slice(0, maxLen) + "..." : str;
+    }
+
+    // ── Utility: safe JSON.stringify with circular reference guard ──────
+    function safeStringify(value: unknown): string {
+      try {
+        return JSON.stringify(value ?? "");
+      } catch {
+        return String(value);
+      }
+    }
+
     // ── Unified notification function ──────────────────────────────────
-    //
-    // Uses gateway internal API directly — no CLI spawn, no deadlock.
-    // api.runtime.system.enqueueSystemEvent + requestHeartbeat
-    //
     async function notify(
       text: string,
       idempotencyKey: string,
@@ -62,8 +83,8 @@ export default definePluginEntry({
 
       try {
         const safeText = text.length > 1000 ? text.slice(0, 1000) + "..." : text;
-        api.runtime.system.enqueueSystemEvent(safeText, { sessionKey });
-        api.runtime.system.requestHeartbeat({
+        api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
+        api.runtime?.system?.requestHeartbeat?.({
           source: "hook",
           intent: "immediate",
           reason: "watchdog notification",
@@ -103,6 +124,7 @@ export default definePluginEntry({
           `不要收到结果后沉默。`;
 
         const continuationKey = `watchdog:continuation:${childKey}`;
+        const ttlMs = config.injectionTtlMs ?? 60_000;
 
         // Primary: enqueueNextTurnInjection for precise session-scoped injection
         if (typeof api.enqueueNextTurnInjection === "function") {
@@ -112,7 +134,7 @@ export default definePluginEntry({
               text: continuationMsg,
               idempotencyKey: continuationKey,
               placement: "prepend_context",
-              ttlMs: 60_000,
+              ttlMs,
             });
             if (result && result.enqueued) {
               markNotified(continuationKey);
@@ -128,8 +150,8 @@ export default definePluginEntry({
         // Fallback: in-process system event
         const safeText = continuationMsg.length > 1000 ? continuationMsg.slice(0, 1000) + "..." : continuationMsg;
         try {
-          api.runtime.system.enqueueSystemEvent(safeText, { sessionKey: parentKey });
-          api.runtime.system.requestHeartbeat({
+          api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey: parentKey });
+          api.runtime?.system?.requestHeartbeat?.({
             source: "hook",
             intent: "immediate",
             reason: "watchdog continuation",
@@ -149,8 +171,8 @@ export default definePluginEntry({
         return;
       }
 
-      const reason = event.reason || outcome;
-      const errorMsg = event.error || "";
+      const reason = truncate(event.reason || outcome, 200);
+      const errorMsg = truncate(event.error || "", 200);
 
       let message: string;
       switch (outcome) {
@@ -187,7 +209,7 @@ export default definePluginEntry({
         ? `watchdog:exec:${runId}`
         : `watchdog:exec:${Date.now()}`;
 
-      const resultStr = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "");
+      const resultStr = typeof event.result === "string" ? event.result : safeStringify(event.result);
       const errorStr = event.error || "";
 
       const isAbnormal =
@@ -202,7 +224,7 @@ export default definePluginEntry({
         return;
       }
 
-      const truncatedResult = resultStr.length > 500 ? resultStr.slice(0, 500) + "..." : resultStr;
+      const truncatedResult = truncate(resultStr, 500);
       const message = `⚠️ Task Watchdog: exec 异常退出\n${errorStr ? `错误: ${errorStr}\n` : ""}输出摘要: ${truncatedResult}\n\n请检查命令执行情况。`;
 
       await notify(message, idempotencyKey, sessionKey);
@@ -213,8 +235,13 @@ export default definePluginEntry({
 
     api.on("heartbeat_prompt_contribution", async (_event, _ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
-      if (config.timerPatrol !== false) return;
-      if ((config.heartbeatPatrol as boolean) === false) return;
+
+      // Clear mutual exclusion: heartbeat patrol only when timer patrol is off
+      const useTimerPatrol = config.timerPatrol !== false;
+      const useHeartbeatPatrol =
+        config.heartbeatPatrol === true ||
+        (!useTimerPatrol && config.heartbeatPatrol !== false);
+      if (!useHeartbeatPatrol) return;
 
       const thresholdMin = Math.round(
         (config.staleThresholdMs ?? STALE_THRESHOLD_MS) / 60_000,
@@ -229,24 +256,17 @@ export default definePluginEntry({
     });
 
     // ── Hook 4: gateway_start — timer-based patrol ──────────────────────
-    //
-    // Previous implementation used `execSync("openclaw tasks list ...")`
-    // which deadlocks when running inside the gateway process (CLI connects
-    // to gateway WS → gateway blocks → deadlock).
-    //
-    // Now uses requestHeartbeat to trigger a heartbeat cycle, which invokes
-    // heartbeat_prompt_contribution (Hook 3) that prompts the AI to check
-    // for stale running tasks — all without any CLI spawn.
-    //
+    let timerPatrolTimer: ReturnType<typeof setInterval> | undefined;
+
     api.on("gateway_start", async (_event, _ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
       if (config.timerPatrol === false) return;
 
       const intervalMs = config.timerPatrolIntervalMs ?? 2 * 60 * 1000;
 
-      const timer = setInterval(() => {
+      timerPatrolTimer = setInterval(() => {
         try {
-          api.runtime.system.requestHeartbeat({
+          api.runtime?.system?.requestHeartbeat?.({
             source: "hook",
             intent: "immediate",
             reason: "watchdog timer patrol",
@@ -257,12 +277,22 @@ export default definePluginEntry({
         }
       }, intervalMs);
 
-      api.on("gateway_stop", () => {
-        clearInterval(timer);
-        log.info("[watchdog] timer patrol stopped");
-      });
-
       log.info(`[watchdog] timer patrol started (interval=${intervalMs}ms)`);
+    });
+
+    // ── Unified cleanup on gateway_stop ─────────────────────────────────
+    api.on("gateway_stop", () => {
+      // Clean up idempotency cleanup timer
+      clearInterval(idempotencyCleanupTimer);
+
+      // Clean up timer patrol
+      if (timerPatrolTimer !== undefined) {
+        clearInterval(timerPatrolTimer);
+        timerPatrolTimer = undefined;
+        log.info("[watchdog] timer patrol stopped");
+      }
+
+      log.info("[watchdog] all timers cleaned up");
     });
 
     log.info("[watchdog] Task Watchdog plugin registered (deadlock-safe edition)");

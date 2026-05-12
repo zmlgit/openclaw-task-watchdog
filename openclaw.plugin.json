@@ -30,6 +30,11 @@
         "default": 300000,
         "description": "TTL for next-turn injection messages (default 5 minutes)"
       },
+      "heartbeatPatrol": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable heartbeat-based patrol (default false). Only effective when timerPatrol is disabled."
+      },
       "timerPatrol": {
         "type": "boolean",
         "default": true,
