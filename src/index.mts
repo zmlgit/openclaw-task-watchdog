@@ -47,8 +47,9 @@ export default definePluginEntry({
     function getReplyInstruction(sessionKey: string): string {
       const routing = sessionChannelMap.get(sessionKey);
       if (!routing) return "";
+      const channel = routing.channel;
       const target = routing.target ? `, target='${routing.target}'` : "";
-      return `\n⚠️ 回复要求：请通过 message(action=send, channel='${routing.channel}'${target}) 回复到原始对话，不要只回复系统事件。`;
+      return `\n⚠️ 回复要求：请通过 message(action=send, channel='${channel}'${target}) 回复到原始对话，不要只回复系统事件。`;
     }
 
     // ── Helper: extract parent session key from subagent key ────────────
@@ -239,9 +240,8 @@ export default definePluginEntry({
       consecutiveToolCalls.set(sessionKey, 0);
 
       // Record channel routing info for reply instructions
-      const evt = event as Record<string, unknown>;
-      const channel = typeof evt.channel === "string" ? evt.channel : "";
-      const target = typeof evt.target === "string" ? evt.target : undefined;
+      const channel = ctx.channelId || "";
+      const target = ctx.conversationId || undefined;
       if (channel) {
         sessionChannelMap.set(sessionKey, { channel, target });
       }
