@@ -35,6 +35,21 @@ export default definePluginEntry({
     const notifiedKeys = new Map<string, number>(); // key → timestamp
     const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+    // ── Consecutive tool call tracking ──────────────────────────────────
+    const consecutiveToolCalls = new Map<string, number>();
+    const consecutiveNudgeCounts = new Map<string, number>();
+    const userMessageTimestamps = new Map<string, number>();
+    const silenceNotifiedKeys = new Map<string, number>();
+
+    // ── Helper: extract parent session key from subagent key ────────────
+    // e.g. "agent:main:subagent:xxx" → try to derive parent
+    function extractParentSessionKey(subKey: string): string {
+      // Best effort: strip the last :subagent:uuid segment
+      const idx = subKey.indexOf(":subagent:");
+      if (idx > 0) return subKey.slice(0, idx);
+      return "main";
+    }
+
     // Cleanup interval for expired idempotency keys — saved for gateway_stop
     const idempotencyCleanupTimer = setInterval(() => {
       const now = Date.now();
@@ -197,10 +212,7 @@ export default definePluginEntry({
       await notify(message, `watchdog:subagent:${childKey}`, parentKey);
     });
 
-    // ── Silence Detection: per-session state ───────────────────────────
-    const consecutiveToolCalls = new Map<string, number>(); // sessionKey → count
-    const userMessageTimestamps = new Map<string, number>(); // sessionKey → timestamp
-    const silenceNotifiedKeys = new Map<string, number>(); // sessionKey → timestamp of last nudge
+    // ── Silence Detection: config ───────────────────────────────────
     const SILENCE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 min cooldown per session
 
     // ── Hook: message_received — track user messages ─────────────────────
@@ -238,15 +250,35 @@ export default definePluginEntry({
       consecutiveToolCalls.set(sessionKey, currentCount);
 
       if (currentCount >= threshold) {
+        // Determine target: if we're inside a subagent, escalate to parent session
+        const isSubagent = /\bsubagent\b/i.test(sessionKey);
+        const targetSession = isSubagent
+          ? ((ctx as Record<string, unknown>).requesterSessionKey as string || extractParentSessionKey(sessionKey))
+          : sessionKey;
+
         const nudgeKey = `watchdog:consecutive:${sessionKey}:${Date.now()}`;
-        // Use a session-based key with time window to avoid spam but still remind
         const lastNudgeTs = silenceNotifiedKeys.get(`consecutive:${sessionKey}`);
         const now = Date.now();
+
+        // Rate limit: max 1 nudge per minute per session
+        // Hard cap: after 10 nudges for same session, escalate to main
+        const nudgeCount = (consecutiveNudgeCounts.get(sessionKey) ?? 0);
+        const shouldEscalate = nudgeCount >= 10;
+        const finalTarget = shouldEscalate ? "main" : targetSession;
+
         if (!lastNudgeTs || now - lastNudgeTs > 60_000) {
-          // Only nudge once per minute per session
+          consecutiveNudgeCounts.set(sessionKey, nudgeCount + 1);
           silenceNotifiedKeys.set(`consecutive:${sessionKey}`, now);
-          const nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。请先向用户汇报当前进度再继续。`;
-          await notify(nudgeMsg, nudgeKey, sessionKey);
+
+          let nudgeMsg: string;
+          if (shouldEscalate) {
+            nudgeMsg = `🔴 Task Watchdog ESCALATION: 子任务 ${sessionKey} 已连续触发 ${nudgeCount} 次工具调用告警仍未恢复。可能处于死循环，请检查并处理。`;
+          } else if (isSubagent) {
+            nudgeMsg = `📢 Task Watchdog: 子任务 ${sessionKey} 已连续调用 ${currentCount} 个工具。请检查子任务状态。`;
+          } else {
+            nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。请先向用户汇报当前进度再继续。`;
+          }
+          await notify(nudgeMsg, nudgeKey, finalTarget);
         }
       }
 
