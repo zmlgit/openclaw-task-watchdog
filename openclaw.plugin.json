@@ -53,6 +53,20 @@
         "maximum": 7200000,
         "default": 1800000,
         "description": "How long a running task is considered stale (default 30 minutes)"
+      },
+      "consecutiveToolCallThreshold": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 20,
+        "default": 5,
+        "description": "Number of consecutive tool calls without a reply before triggering a nudge (default 5)"
+      },
+      "silenceThresholdMs": {
+        "type": "integer",
+        "minimum": 60000,
+        "maximum": 1800000,
+        "default": 180000,
+        "description": "How long after a user message without reply before triggering a silence nudge (default 3 minutes)"
       }
     }
   }

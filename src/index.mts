@@ -156,7 +156,7 @@ export default definePluginEntry({
           `不要收到结果后沉默。${replyHint}`;
 
         const continuationKey = `watchdog:continuation:${childKey}`;
-        const ttlMs = config.injectionTtlMs ?? 60_000;
+        const ttlMs = config.injectionTtlMs ?? 300_000;
 
         // Primary: enqueueNextTurnInjection for precise session-scoped injection
         if (typeof api.enqueueNextTurnInjection === "function") {
@@ -436,8 +436,14 @@ export default definePluginEntry({
             if (now - ts > 30 * 60 * 1000) userMessageTimestamps.delete(key);
           }
           for (const [key] of consecutiveToolCalls) {
-            // Reset stale counters (no activity in 10 min)
-            // These get reset on before_agent_reply and message_received anyway
+            // These are reset on before_agent_reply / message_received, but
+            // prune stale entries here too (no activity seen in 10 min)
+            // We don't have per-entry timestamps, so rely on the userMessageTimestamps
+            // as a proxy — if that session has no recent user message, clean up.
+            if (!userMessageTimestamps.has(key)) {
+              consecutiveToolCalls.delete(key);
+              consecutiveNudgeCounts.delete(key);
+            }
           }
 
           log.debug("[watchdog] timer patrol: requested heartbeat + silence check");
@@ -464,7 +470,9 @@ export default definePluginEntry({
       // Clean up silence detection maps
       userMessageTimestamps.clear();
       consecutiveToolCalls.clear();
+      consecutiveNudgeCounts.clear();
       silenceNotifiedKeys.clear();
+      sessionChannelMap.clear();
 
       log.info("[watchdog] all timers cleaned up");
     });
