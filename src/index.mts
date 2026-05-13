@@ -41,6 +41,16 @@ export default definePluginEntry({
     const userMessageTimestamps = new Map<string, number>();
     const silenceNotifiedKeys = new Map<string, number>();
 
+    // ── Session → channel routing (for reply-to-feishu instructions) ────
+    const sessionChannelMap = new Map<string, { channel: string; target?: string }>();
+
+    function getReplyInstruction(sessionKey: string): string {
+      const routing = sessionChannelMap.get(sessionKey);
+      if (!routing) return "";
+      const target = routing.target ? `, target='${routing.target}'` : "";
+      return `\n⚠️ 回复要求：请通过 message(action=send, channel='${routing.channel}'${target}) 回复到原始对话，不要只回复系统事件。`;
+    }
+
     // ── Helper: extract parent session key from subagent key ────────────
     // e.g. "agent:main:subagent:xxx" → try to derive parent
     function extractParentSessionKey(subKey: string): string {
@@ -99,7 +109,10 @@ export default definePluginEntry({
       }
 
       try {
-        const safeText = text.length > 1000 ? text.slice(0, 1000) + "..." : text;
+        // Append reply routing instruction so agent knows to respond via the original channel
+        const replyHint = getReplyInstruction(sessionKey);
+        const fullText = replyHint ? text + replyHint : text;
+        const safeText = fullText.length > 1200 ? fullText.slice(0, 1200) + "..." : fullText;
         api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
         api.runtime?.system?.requestHeartbeat?.({
           source: "hook",
@@ -135,10 +148,11 @@ export default definePluginEntry({
       // ── Normal completion (outcome=ok): continuation reminder ──
       if (outcome === "ok") {
         const label = (event as Record<string, unknown>).label as string | undefined;
+        const replyHint = getReplyInstruction(parentKey);
         const continuationMsg =
           `[Task Continuation] 子任务 ${label || childKey} 已完成。\n` +
           `请分析子任务结果并决定下一步：继续执行 / 汇报用户 / 询问用户。\n` +
-          `不要收到结果后沉默。`;
+          `不要收到结果后沉默。${replyHint}`;
 
         const continuationKey = `watchdog:continuation:${childKey}`;
         const ttlMs = config.injectionTtlMs ?? 60_000;
@@ -216,13 +230,22 @@ export default definePluginEntry({
     const SILENCE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 min cooldown per session
 
     // ── Hook: message_received — track user messages ─────────────────────
-    api.on("message_received", async (_event, ctx) => {
+    api.on("message_received", async (event, ctx) => {
       const sessionKey = ctx.sessionKey;
       if (!sessionKey) return;
 
       userMessageTimestamps.set(sessionKey, Date.now());
       // Reset consecutive tool call counter on new user message
       consecutiveToolCalls.set(sessionKey, 0);
+
+      // Record channel routing info for reply instructions
+      const evt = event as Record<string, unknown>;
+      const channel = typeof evt.channel === "string" ? evt.channel : "";
+      const target = typeof evt.target === "string" ? evt.target : undefined;
+      if (channel) {
+        sessionChannelMap.set(sessionKey, { channel, target });
+      }
+
       log.debug(`[watchdog] message_received: recorded timestamp for session=${sessionKey}`);
     });
 
