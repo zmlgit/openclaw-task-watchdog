@@ -314,6 +314,24 @@ export default definePluginEntry({
 
       const intervalMs = config.timerPatrolIntervalMs ?? 2 * 60 * 1000;
 
+      // ── Immediate wake on gateway start ──
+      // Trigger a heartbeat right away so the agent checks for
+      // unreplied user messages and interrupted tasks after a restart.
+      try {
+        api.runtime?.system?.enqueueSystemEvent?.(
+          "[Task Watchdog] Gateway 重启完成。请检查是否有未回复的用户消息或被中断的任务，立即处理。",
+          { sessionKey: "main" },
+        );
+        api.runtime?.system?.requestHeartbeat?.({
+          source: "hook",
+          intent: "immediate",
+          reason: "watchdog gateway restart recovery",
+        });
+        log.info("[watchdog] gateway_start: immediate wake triggered for restart recovery");
+      } catch (wakeErr) {
+        log.warn(`[watchdog] gateway_start immediate wake failed: ${wakeErr instanceof Error ? wakeErr.message : String(wakeErr)}`);
+      }
+
       timerPatrolTimer = setInterval(() => {
         try {
           api.runtime?.system?.requestHeartbeat?.({
