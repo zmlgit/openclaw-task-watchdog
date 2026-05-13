@@ -11,6 +11,8 @@ type WatchdogConfig = {
   timerPatrol?: boolean;
   timerPatrolIntervalMs?: number;
   staleThresholdMs?: number;
+  consecutiveToolCallThreshold?: number;
+  silenceThresholdMs?: number;
 };
 
 /** Max entries in the idempotency map */
@@ -195,14 +197,62 @@ export default definePluginEntry({
       await notify(message, `watchdog:subagent:${childKey}`, parentKey);
     });
 
-    // ── Hook 2: after_tool_call for exec ─────────────────────────────────
-    api.on("after_tool_call", async (event, ctx) => {
-      const config = (api.pluginConfig as WatchdogConfig) ?? {};
-      if (config.execNotifyOnAbnormal === false) return;
-      if (event.toolName !== "exec") return;
+    // ── Silence Detection: per-session state ───────────────────────────
+    const consecutiveToolCalls = new Map<string, number>(); // sessionKey → count
+    const userMessageTimestamps = new Map<string, number>(); // sessionKey → timestamp
+    const silenceNotifiedKeys = new Map<string, number>(); // sessionKey → timestamp of last nudge
+    const SILENCE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 min cooldown per session
 
+    // ── Hook: message_received — track user messages ─────────────────────
+    api.on("message_received", async (_event, ctx) => {
       const sessionKey = ctx.sessionKey;
       if (!sessionKey) return;
+
+      userMessageTimestamps.set(sessionKey, Date.now());
+      // Reset consecutive tool call counter on new user message
+      consecutiveToolCalls.set(sessionKey, 0);
+      log.debug(`[watchdog] message_received: recorded timestamp for session=${sessionKey}`);
+    });
+
+    // ── Hook: before_agent_reply — reset counters ───────────────────────
+    api.on("before_agent_reply", async (_event, ctx) => {
+      const sessionKey = ctx.sessionKey;
+      if (!sessionKey) return;
+
+      // Agent is replying — reset consecutive tool call counter
+      consecutiveToolCalls.set(sessionKey, 0);
+      // Clear the pending user message timestamp (agent is responding)
+      userMessageTimestamps.delete(sessionKey);
+      log.debug(`[watchdog] before_agent_reply: reset counters for session=${sessionKey}`);
+    });
+
+    // ── Hook 2: after_tool_call (exec + consecutive detection) ──────────────
+    api.on("after_tool_call", async (event, ctx) => {
+      const config = (api.pluginConfig as WatchdogConfig) ?? {};
+      const sessionKey = ctx.sessionKey;
+      if (!sessionKey) return;
+
+           // ── Part A: Consecutive tool call detection (all tools) ──
+      const threshold = config.consecutiveToolCallThreshold ?? 5;
+      const currentCount = (consecutiveToolCalls.get(sessionKey) ?? 0) + 1;
+      consecutiveToolCalls.set(sessionKey, currentCount);
+
+      if (currentCount >= threshold) {
+        const nudgeKey = `watchdog:consecutive:${sessionKey}:${Date.now()}`;
+        // Use a session-based key with time window to avoid spam but still remind
+        const lastNudgeTs = silenceNotifiedKeys.get(`consecutive:${sessionKey}`);
+        const now = Date.now();
+        if (!lastNudgeTs || now - lastNudgeTs > 60_000) {
+          // Only nudge once per minute per session
+          silenceNotifiedKeys.set(`consecutive:${sessionKey}`, now);
+          const nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。请先向用户汇报当前进度再继续。`;
+          await notify(nudgeMsg, nudgeKey, sessionKey);
+        }
+      }
+
+           // ── Part B: Original exec abnormal detection ──
+      if (config.execNotifyOnAbnormal === false) return;
+      if (event.toolName !== "exec") return;
 
       const runId = event.runId || ctx.runId;
       const idempotencyKey = runId
@@ -271,7 +321,53 @@ export default definePluginEntry({
             intent: "immediate",
             reason: "watchdog timer patrol",
           });
-          log.debug("[watchdog] timer patrol: requested heartbeat");
+
+                   // ── Silence detection patrol ──
+          const config = (api.pluginConfig as WatchdogConfig) ?? {};
+          const silenceThreshold = config.silenceThresholdMs ?? 180_000; // 3 minutes
+          const now = Date.now();
+
+          for (const [sessionKey, msgTs] of userMessageTimestamps) {
+            const elapsed = now - msgTs;
+            if (elapsed >= silenceThreshold) {
+              const lastNudge = silenceNotifiedKeys.get(`silence:${sessionKey}`);
+              if (lastNudge && now - lastNudge < SILENCE_IDEMPOTENCY_TTL_MS) continue;
+
+              const elapsedMin = Math.round(elapsed / 60_000);
+              const silenceMsg = `⏰ Task Watchdog: 用户消息已等待 ${elapsedMin} 分钟没有收到回复。请尽快回复用户。如果有正在执行的任务，先给用户一个进度汇报。`;
+              const silenceKey = `watchdog:silence:${sessionKey}:${now}`;
+              silenceNotifiedKeys.set(`silence:${sessionKey}`, now);
+
+              try {
+                api.runtime?.system?.enqueueSystemEvent?.(silenceMsg, { sessionKey });
+                api.runtime?.system?.requestHeartbeat?.({
+                  source: "hook",
+                  intent: "immediate",
+                  reason: "watchdog silence nudge",
+                  sessionKey,
+                });
+                markNotified(silenceKey);
+                log.info(`[watchdog] silence nudge sent for session=${sessionKey} (${elapsedMin}min)`);
+              } catch (err) {
+                log.warn(`[watchdog] silence nudge failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+          }
+
+          // Cleanup expired silence state
+          for (const [key, ts] of silenceNotifiedKeys) {
+            if (now - ts > SILENCE_IDEMPOTENCY_TTL_MS) silenceNotifiedKeys.delete(key);
+          }
+          for (const [key, ts] of userMessageTimestamps) {
+            // Remove entries older than 30 minutes (agent likely responded or session ended)
+            if (now - ts > 30 * 60 * 1000) userMessageTimestamps.delete(key);
+          }
+          for (const [key] of consecutiveToolCalls) {
+            // Reset stale counters (no activity in 10 min)
+            // These get reset on before_agent_reply and message_received anyway
+          }
+
+          log.debug("[watchdog] timer patrol: requested heartbeat + silence check");
         } catch (err) {
           log.debug(`[watchdog] timer patrol error: ${err}`);
         }
@@ -291,6 +387,11 @@ export default definePluginEntry({
         timerPatrolTimer = undefined;
         log.info("[watchdog] timer patrol stopped");
       }
+
+      // Clean up silence detection maps
+      userMessageTimestamps.clear();
+      consecutiveToolCalls.clear();
+      silenceNotifiedKeys.clear();
 
       log.info("[watchdog] all timers cleaned up");
     });

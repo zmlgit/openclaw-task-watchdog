@@ -55,6 +55,8 @@ OpenClaw excels at dispatching subagents and running long tasks via `exec`. But 
 | **`after_tool_call` (exec)** | Watches for abnormal `exec` exits — non-zero exit codes, OOM kills, signals, permission denied, command not found. |
 | **`heartbeat_prompt_contribution`** | When timer patrol is off, injects patrol instructions into heartbeat cycles to check for stale running tasks. |
 | **`gateway_start`** | Starts a timer-based patrol that periodically requests heartbeats to trigger stale-task checks. |
+| **`message_received`** | Records user message timestamps for silence detection. Resets consecutive tool call counter. |
+| **`before_agent_reply`** | Resets consecutive tool call counter and clears silence timer when agent replies. |
 
 ### Design Principles
 
@@ -62,6 +64,13 @@ OpenClaw excels at dispatching subagents and running long tasks via `exec`. But 
 - **Idempotent**: Each notification uses an `idempotencyKey` to prevent duplicates
 - **Zero-config**: Works out of the box with sensible defaults
 - **Memory-safe**: Idempotency map capped at 10,000 entries with TTL-based eviction
+
+### Silence Detection
+
+The plugin detects two types of agent silence:
+
+1. **Consecutive tool calls without reply**: If the agent calls more than `consecutiveToolCallThreshold` tools in a row without replying to the user, a nudge is injected (once per minute per session).
+2. **User message timeout**: If a user sends a message but doesn't receive a reply within `silenceThresholdMs`, a silence nudge is triggered during the next timer patrol cycle.
 
 ## Installation
 
@@ -86,6 +95,8 @@ All settings are optional. Configure via `openclaw.plugin.json` → `config`:
 | `heartbeatPatrol` | `boolean` | `false` | Enable heartbeat-based patrol (only when timerPatrol is disabled) |
 | `timerPatrolIntervalMs` | `integer` | `120000` (2 min) | Timer patrol interval (30000–600000 ms) |
 | `staleThresholdMs` | `integer` | `1800000` (30 min) | How long before a task is considered stale (60000–7200000 ms) |
+| `consecutiveToolCallThreshold` | `integer` | `5` | Number of consecutive tool calls without a reply before triggering a nudge (2–20) |
+| `silenceThresholdMs` | `integer` | `180000` (3 min) | How long after a user message without reply before triggering a silence nudge (60000–1800000 ms) |
 
 Example:
 

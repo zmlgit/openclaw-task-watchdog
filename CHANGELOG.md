@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-05-13
+
+### Added
+- **Consecutive tool call detection**: Nudges the agent when it calls more than `consecutiveToolCallThreshold` tools without replying to the user (default: 5, rate-limited to once per minute)
+- **User message silence detection**: Triggers a nudge when a user message goes unanswered for longer than `silenceThresholdMs` (default: 3 minutes)
+- New hooks: `message_received` (track user message timestamps) and `before_agent_reply` (reset counters)
+- New config options: `consecutiveToolCallThreshold` (2–20) and `silenceThresholdMs` (60000–1800000)
+- Silence detection state maps cleaned up on `gateway_stop` and periodically pruned
+
 ## [1.2.0] - 2026-05-13
 
 ### Added
