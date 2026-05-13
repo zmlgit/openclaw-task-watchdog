@@ -108,6 +108,7 @@ export default definePluginEntry({
       text: string,
       idempotencyKey: string,
       sessionKey: string,
+      forceDelivery: boolean = false,
     ): Promise<boolean> {
       if (isNotified(idempotencyKey)) {
         log.debug(`[watchdog] already notified → ${idempotencyKey}`);
@@ -115,18 +116,30 @@ export default definePluginEntry({
       }
 
       try {
-        // Append reply routing instruction so agent knows to respond via the original channel
         const replyHint = getReplyInstruction(sessionKey);
         const fullText = replyHint ? text + replyHint : text;
         const safeText = fullText.length > 1200 ? fullText.slice(0, 1200) + "..." : fullText;
         api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
-        api.runtime?.system?.requestHeartbeat?.({
-          source: "hook",
-          intent: "immediate",
-          reason: "watchdog notification",
-        });
+
+        if (forceDelivery) {
+          // Use runHeartbeatOnce with target="last" to force delivery to the user's channel
+          // This bypasses the default suppression and ensures the user sees the notification
+          api.runtime?.system?.runHeartbeatOnce?.({
+            reason: "watchdog forced delivery",
+            sessionKey,
+            heartbeat: { target: "last" },
+          }).catch((err: unknown) => {
+            log.warn(`[watchdog] runHeartbeatOnce failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        } else {
+          api.runtime?.system?.requestHeartbeat?.({
+            source: "hook",
+            intent: "immediate",
+            reason: "watchdog notification",
+          });
+        }
         markNotified(idempotencyKey);
-        log.info(`[watchdog] notified via system event API → ${idempotencyKey}`);
+        log.info(`[watchdog] notified (forceDelivery=${forceDelivery}) → ${idempotencyKey}`);
         return true;
       } catch (err) {
         log.error(
@@ -316,7 +329,7 @@ export default definePluginEntry({
           } else {
             nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。请先向用户汇报当前进度再继续。`;
           }
-          await notify(nudgeMsg, nudgeKey, finalTarget);
+          await notify(nudgeMsg, nudgeKey, finalTarget, shouldEscalate);
         }
       }
 
@@ -403,7 +416,7 @@ export default definePluginEntry({
         log.warn(`[watchdog] gateway_start immediate wake failed: ${wakeErr instanceof Error ? wakeErr.message : String(wakeErr)}`);
       }
 
-      timerPatrolTimer = setInterval(() => {
+      timerPatrolTimer = setInterval(async () => {
         try {
           api.runtime?.system?.requestHeartbeat?.({
             source: "hook",
@@ -427,19 +440,9 @@ export default definePluginEntry({
               const silenceKey = `watchdog:silence:${sessionKey}:${now}`;
               silenceNotifiedKeys.set(`silence:${sessionKey}`, now);
 
-              try {
-                api.runtime?.system?.enqueueSystemEvent?.(silenceMsg, { sessionKey });
-                api.runtime?.system?.requestHeartbeat?.({
-                  source: "hook",
-                  intent: "immediate",
-                  reason: "watchdog silence nudge",
-                  sessionKey,
-                });
-                markNotified(silenceKey);
-                log.info(`[watchdog] silence nudge sent for session=${sessionKey} (${elapsedMin}min)`);
-              } catch (err) {
-                log.warn(`[watchdog] silence nudge failed: ${err instanceof Error ? err.message : String(err)}`);
-              }
+              // forceDelivery=true: use runHeartbeatOnce to guarantee delivery to user's channel
+              await notify(silenceMsg, silenceKey, sessionKey, true);
+              log.info(`[watchdog] silence nudge sent for session=${sessionKey} (${elapsedMin}min)`);
             }
           }
 
