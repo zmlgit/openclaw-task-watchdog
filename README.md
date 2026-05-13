@@ -96,6 +96,7 @@ All settings are optional. Configure via `openclaw.plugin.json` → `config`:
 | `timerPatrolIntervalMs` | `integer` | `120000` (2 min) | Timer patrol interval (30000–600000 ms) |
 | `staleThresholdMs` | `integer` | `1800000` (30 min) | How long before a task is considered stale (60000–7200000 ms) |
 | `consecutiveToolCallThreshold` | `integer` | `5` | Number of consecutive tool calls without a reply before triggering a nudge (2–20) |
+| `subagentConsecutiveThreshold` | `integer` | `15` | Consecutive tool call threshold for subagent sessions. Defaults to `consecutiveToolCallThreshold * 3` if not set |
 | `silenceThresholdMs` | `integer` | `180000` (3 min) | How long after a user message without reply before triggering a silence nudge (60000–1800000 ms) |
 
 Example:

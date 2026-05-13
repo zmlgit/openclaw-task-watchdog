@@ -12,6 +12,7 @@ type WatchdogConfig = {
   timerPatrolIntervalMs?: number;
   staleThresholdMs?: number;
   consecutiveToolCallThreshold?: number;
+  subagentConsecutiveThreshold?: number;
   silenceThresholdMs?: number;
 };
 
@@ -43,6 +44,10 @@ export default definePluginEntry({
 
     // ── Session → channel routing (for reply-to-feishu instructions) ────
     const sessionChannelMap = new Map<string, { channel: string; target?: string }>();
+
+    // ── Main session key tracking (for escalation target) ───────────────
+    // Records the primary (non-subagent) session key seen in message_received
+    let lastMainSessionKey: string | undefined;
 
     function getReplyInstruction(sessionKey: string): string {
       const routing = sessionChannelMap.get(sessionKey);
@@ -246,6 +251,11 @@ export default definePluginEntry({
         sessionChannelMap.set(sessionKey, { channel, target });
       }
 
+      // Track main (non-subagent) session key for escalation target
+      if (!/\bsubagent\b/i.test(sessionKey)) {
+        lastMainSessionKey = sessionKey;
+      }
+
       log.debug(`[watchdog] message_received: recorded timestamp for session=${sessionKey}`);
     });
 
@@ -268,7 +278,11 @@ export default definePluginEntry({
       if (!sessionKey) return;
 
            // ── Part A: Consecutive tool call detection (all tools) ──
-      const threshold = config.consecutiveToolCallThreshold ?? 5;
+      const isSubagentSession = /:subagent:/i.test(sessionKey);
+      const baseThreshold = config.consecutiveToolCallThreshold ?? 5;
+      const threshold = isSubagentSession
+        ? (config.subagentConsecutiveThreshold ?? baseThreshold * 3)
+        : baseThreshold;
       const currentCount = (consecutiveToolCalls.get(sessionKey) ?? 0) + 1;
       consecutiveToolCalls.set(sessionKey, currentCount);
 
@@ -287,7 +301,8 @@ export default definePluginEntry({
         // Hard cap: after 10 nudges for same session, escalate to main
         const nudgeCount = (consecutiveNudgeCounts.get(sessionKey) ?? 0);
         const shouldEscalate = nudgeCount >= 10;
-        const finalTarget = shouldEscalate ? "main" : targetSession;
+        const escalationTarget = lastMainSessionKey || extractParentSessionKey(sessionKey);
+        const finalTarget = shouldEscalate ? escalationTarget : targetSession;
 
         if (!lastNudgeTs || now - lastNudgeTs > 60_000) {
           consecutiveNudgeCounts.set(sessionKey, nudgeCount + 1);
@@ -373,9 +388,10 @@ export default definePluginEntry({
       // Trigger a heartbeat right away so the agent checks for
       // unreplied user messages and interrupted tasks after a restart.
       try {
+        const wakeSessionKey = lastMainSessionKey || "main";
         api.runtime?.system?.enqueueSystemEvent?.(
           "[Task Watchdog] Gateway 重启完成。请检查是否有未回复的用户消息或被中断的任务，立即处理。",
-          { sessionKey: "main" },
+          { sessionKey: wakeSessionKey },
         );
         api.runtime?.system?.requestHeartbeat?.({
           source: "hook",
