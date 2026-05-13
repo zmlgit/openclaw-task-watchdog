@@ -40,6 +40,7 @@ export default definePluginEntry({
     const consecutiveToolCalls = new Map<string, number>();
     const consecutiveNudgeCounts = new Map<string, number>();
     const userMessageTimestamps = new Map<string, number>();
+    const userMessageContent = new Map<string, string>(); // sessionKey → last user message content
     const silenceNotifiedKeys = new Map<string, number>();
 
     // ── Session → channel routing (for reply-to-feishu instructions) ────
@@ -117,7 +118,14 @@ export default definePluginEntry({
 
       try {
         const replyHint = getReplyInstruction(sessionKey);
-        const fullText = replyHint ? text + replyHint : text;
+        // Build notification with user message context
+        const userMsg = userMessageContent.get(sessionKey);
+        let fullText = text;
+        if (userMsg) {
+          const truncated = userMsg.length > 200 ? userMsg.slice(0, 200) + "..." : userMsg;
+          fullText += `\n\n用户最新消息：${truncated}`;
+        }
+        fullText += replyHint;
         const safeText = fullText.length > 1200 ? fullText.slice(0, 1200) + "..." : fullText;
         api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
 
@@ -258,6 +266,10 @@ export default definePluginEntry({
       if (!sessionKey) return;
 
       userMessageTimestamps.set(sessionKey, Date.now());
+      // Record user message content for notification context
+      const evt = event as Record<string, unknown>;
+      const content = typeof evt.content === "string" ? evt.content : "";
+      if (content) userMessageContent.set(sessionKey, content);
       // Reset consecutive tool call counter on new user message
       consecutiveToolCalls.set(sessionKey, 0);
 
@@ -331,7 +343,7 @@ export default definePluginEntry({
           } else if (isSubagent) {
             nudgeMsg = `📢 Task Watchdog: 子任务 ${sessionKey} 已连续调用 ${currentCount} 个工具。请检查子任务状态。`;
           } else {
-            nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。请先向用户汇报当前进度再继续。`;
+            nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。`;
           }
           await notify(nudgeMsg, nudgeKey, finalTarget, shouldEscalate);
         }
