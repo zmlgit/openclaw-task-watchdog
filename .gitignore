@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.js.map
 *.mjs.map
+*.d.ts
+*.d.mts.map
+.DS_Store
+*.tgz
