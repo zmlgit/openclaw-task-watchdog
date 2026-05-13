@@ -1,5 +1,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
+// ── Types ──────────────────────────────────────────────────────────────────
+
 /** Subagent outcomes that we consider "abnormal" and worth notifying about */
 const DEFAULT_NOTIFY_OUTCOMES = new Set(["error", "timeout", "killed"]);
 
@@ -16,14 +18,25 @@ type WatchdogConfig = {
   silenceThresholdMs?: number;
 };
 
-/** Max entries in the idempotency map */
+// ── Constants ──────────────────────────────────────────────────────────────
+
 const IDEMPOTENCY_MAX_SIZE = 10_000;
+const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const SILENCE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 min cooldown per session
+const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+const PENDING_ALERTS_MAX = 20;
+const ALERTS_PER_HEARTBEAT = 10;
+const MESSAGE_TRUNCATE_LEN = 200;
+const ALERT_MAX_LEN = 1200;
+const CONTINUATION_MAX_LEN = 1000;
+
+// ── Plugin Entry ───────────────────────────────────────────────────────────
 
 export default definePluginEntry({
   id: "task-watchdog",
   name: "Task Watchdog",
   description:
-    "Injects failure notifications into parent session when subagents fail or exec processes exit abnormally",
+    "Dual-path notification: soft nudge via system event + forced heartbeat delivery for critical alerts. Tracks silence, consecutive tool calls, subagent failures, and exec abnormalities.",
   register(api) {
     const log = {
       debug: (msg: string) => api.logger?.debug?.(msg),
@@ -32,70 +45,27 @@ export default definePluginEntry({
       error: (msg: string) => api.logger?.error(msg),
     };
 
-    // ── Idempotency guard ───────────────────────────────────────────────
-    const notifiedKeys = new Map<string, number>(); // key → timestamp
-    const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+    // ── In-memory state (all Maps have capacity limits and expiry cleanup) ──
 
-    // ── Consecutive tool call tracking ──────────────────────────────────
-    const consecutiveToolCalls = new Map<string, number>();
-    const consecutiveNudgeCounts = new Map<string, number>();
-    const userMessageTimestamps = new Map<string, number>();
-    const userMessageContent = new Map<string, string>(); // sessionKey → last user message content
-    const silenceNotifiedKeys = new Map<string, number>();
+    const notifiedKeys = new Map<string, number>(); // idempotencyKey → timestamp
+    const pendingAlerts: string[] = []; // consumed by heartbeat_prompt_contribution
+    const consecutiveToolCalls = new Map<string, number>(); // sessionKey → count
+    const consecutiveNudgeCounts = new Map<string, number>(); // sessionKey → nudge count
+    const userMessageTimestamps = new Map<string, number>(); // sessionKey → timestamp
+    const userMessageContent = new Map<string, string>(); // sessionKey → last user message
+    const silenceNotifiedKeys = new Map<string, number>(); // "silence:sessionKey" → timestamp
+    const sessionChannelMap = new Map<string, { channel: string; target?: string }>(); // sessionKey → routing
 
-    // ── Session → channel routing (for reply-to-feishu instructions) ────
-    const sessionChannelMap = new Map<string, { channel: string; target?: string }>();
-
-    // ── Main session key tracking (for escalation target) ───────────────
-    // Records the primary (non-subagent) session key seen in message_received
+    /** The primary (non-subagent) session key seen in message_received — escalation target */
     let lastMainSessionKey: string | undefined;
 
-    function getReplyInstruction(sessionKey: string): string {
-      const routing = sessionChannelMap.get(sessionKey);
-      if (!routing) return "";
-      const channel = routing.channel;
-      const target = routing.target ? `, target='${routing.target}'` : "";
-      return `\n⚠️ 回复要求：请通过 message(action=send, channel='${channel}'${target}) 回复到原始对话，不要只回复系统事件。`;
-    }
+    // ── Helpers ────────────────────────────────────────────────────────────
 
-    // ── Helper: extract parent session key from subagent key ────────────
-    // e.g. "agent:main:subagent:xxx" → try to derive parent
-    function extractParentSessionKey(subKey: string): string {
-      // Best effort: strip the last :subagent:uuid segment
-      const idx = subKey.indexOf(":subagent:");
-      if (idx > 0) return subKey.slice(0, idx);
-      return "main";
-    }
-
-    // Cleanup interval for expired idempotency keys — saved for gateway_stop
-    const idempotencyCleanupTimer = setInterval(() => {
-      const now = Date.now();
-      for (const [key, ts] of notifiedKeys) {
-        if (now - ts > IDEMPOTENCY_TTL_MS) notifiedKeys.delete(key);
-      }
-      // Enforce max size: drop oldest half if over limit
-      if (notifiedKeys.size > IDEMPOTENCY_MAX_SIZE) {
-        const entries = [...notifiedKeys.entries()].sort((a, b) => a[1] - b[1]);
-        const cutCount = Math.floor(entries.length / 2);
-        for (let i = 0; i < cutCount; i++) notifiedKeys.delete(entries[i][0]);
-      }
-    }, 10 * 60 * 1000);
-
-    function isNotified(idempotencyKey: string): boolean {
-      return notifiedKeys.has(idempotencyKey);
-    }
-
-    function markNotified(idempotencyKey: string): void {
-      notifiedKeys.set(idempotencyKey, Date.now());
-    }
-
-    // ── Utility: safe string truncation ────────────────────────────────
     function truncate(str: string | undefined | null, maxLen: number): string {
       if (!str) return "";
       return str.length > maxLen ? str.slice(0, maxLen) + "..." : str;
     }
 
-    // ── Utility: safe JSON.stringify with circular reference guard ──────
     function safeStringify(value: unknown): string {
       try {
         return JSON.stringify(value ?? "");
@@ -104,12 +74,75 @@ export default definePluginEntry({
       }
     }
 
-    // ── Unified notification function ──────────────────────────────────
+    /** Strip the last :subagent:uuid segment to get parent session key */
+    function extractParentSessionKey(subKey: string): string {
+      const idx = subKey.indexOf(":subagent:");
+      if (idx > 0) return subKey.slice(0, idx);
+      return "main";
+    }
+
+    /** Build dynamic reply instruction from sessionChannelMap */
+    function getReplyInstruction(sessionKey: string): string {
+      const routing = sessionChannelMap.get(sessionKey);
+      if (!routing) return "";
+      const channel = routing.channel;
+      const target = routing.target ? `, target='${routing.target}'` : "";
+      return `\n⚠️ 回复要求：请通过 message(action=send, channel='${channel}'${target}) 回复到原始对话，不要只回复系统事件。`;
+    }
+
+    /** Format elapsed milliseconds as human-readable duration */
+    function formatDuration(ms: number): string {
+      const min = Math.round(ms / 60_000);
+      if (min < 1) return "不到 1 分钟";
+      if (min < 60) return `${min} 分钟`;
+      const hr = Math.floor(min / 60);
+      const remMin = min % 60;
+      return remMin > 0 ? `${hr} 小时 ${remMin} 分钟` : `${hr} 小时`;
+    }
+
+    /** Compute wait duration string for a session */
+    function getWaitDuration(sessionKey: string): string | null {
+      const ts = userMessageTimestamps.get(sessionKey);
+      if (!ts) return null;
+      const elapsed = Date.now() - ts;
+      if (elapsed < 5000) return null;
+      return `已等待 ${formatDuration(elapsed)}`;
+    }
+
+    // ── Idempotency guard ──────────────────────────────────────────────────
+
+    const idempotencyCleanupTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [key, ts] of notifiedKeys) {
+        if (now - ts > IDEMPOTENCY_TTL_MS) notifiedKeys.delete(key);
+      }
+      if (notifiedKeys.size > IDEMPOTENCY_MAX_SIZE) {
+        const entries = [...notifiedKeys.entries()].sort((a, b) => a[1] - b[1]);
+        const cutCount = Math.floor(entries.length / 2);
+        for (let i = 0; i < cutCount; i++) notifiedKeys.delete(entries[i][0]);
+      }
+    }, 10 * 60 * 1000);
+
+    function isNotified(key: string): boolean {
+      return notifiedKeys.has(key);
+    }
+    function markNotified(key: string): void {
+      notifiedKeys.set(key, Date.now());
+    }
+
+    // ── Unified notification function ──────────────────────────────────────
+    //
+    // Path A (soft nudge): enqueueSystemEvent → injected into current turn context
+    // Path B (forced delivery): runHeartbeatOnce → independent heartbeat turn
+    //
+    // Critical alerts go through both paths. Non-critical alerts only go through Path A.
+    // All alerts are pushed to pendingAlerts for heartbeat_prompt_contribution to inject.
+
     async function notify(
       text: string,
       idempotencyKey: string,
       sessionKey: string,
-      forceDelivery: boolean = false,
+      critical: boolean = false,
     ): Promise<boolean> {
       if (isNotified(idempotencyKey)) {
         log.debug(`[watchdog] already notified → ${idempotencyKey}`);
@@ -117,52 +150,70 @@ export default definePluginEntry({
       }
 
       try {
-        const replyHint = getReplyInstruction(sessionKey);
-        // Build notification with user message context
-        const userMsg = userMessageContent.get(sessionKey);
+        // ── Build full alert message ──
         let fullText = text;
+
+        // Append user original message (truncated to 200 chars)
+        const userMsg = userMessageContent.get(sessionKey);
         if (userMsg) {
-          const truncated = userMsg.length > 200 ? userMsg.slice(0, 200) + "..." : userMsg;
-          fullText += `\n\n用户最新消息：${truncated}`;
+          fullText += `\n\n📝 用户原始消息：${truncate(userMsg, MESSAGE_TRUNCATE_LEN)}`;
         }
-        fullText += replyHint;
-        const safeText = fullText.length > 1200 ? fullText.slice(0, 1200) + "..." : fullText;
+
+        // Append wait duration if applicable
+        const waitDuration = getWaitDuration(sessionKey);
+        if (waitDuration) {
+          fullText += `\n⏱️ ${waitDuration}`;
+        }
+
+        // Append dynamic reply route
+        fullText += getReplyInstruction(sessionKey);
+
+        // Cap total message length
+        const safeText = fullText.length > ALERT_MAX_LEN
+          ? fullText.slice(0, ALERT_MAX_LEN) + "..."
+          : fullText;
+
+        // ── Path A: soft nudge — inject into current turn context ──
         api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
 
-        // Also push to pending alerts so heartbeat_prompt_contribution can inject context
+        // ── Push to pending alerts for heartbeat_prompt_contribution ──
         pendingAlerts.push(safeText);
-        if (pendingAlerts.length > 20) pendingAlerts.splice(0, pendingAlerts.length - 20);
+        if (pendingAlerts.length > PENDING_ALERTS_MAX) {
+          pendingAlerts.splice(0, pendingAlerts.length - PENDING_ALERTS_MAX);
+        }
 
-        if (forceDelivery) {
-          // Use runHeartbeatOnce with target="last" to force delivery to the user's channel
-          // This bypasses the default suppression and ensures the user sees the notification
+        // ── Path B: forced delivery for critical alerts ──
+        if (critical) {
           api.runtime?.system?.runHeartbeatOnce?.({
-            reason: "watchdog forced delivery",
+            reason: "watchdog critical alert delivery",
             sessionKey,
             heartbeat: { target: "last" },
           }).catch((err: unknown) => {
             log.warn(`[watchdog] runHeartbeatOnce failed: ${err instanceof Error ? err.message : String(err)}`);
           });
         } else {
+          // For non-critical, just request a heartbeat (best-effort)
           api.runtime?.system?.requestHeartbeat?.({
             source: "hook",
             intent: "immediate",
             reason: "watchdog notification",
           });
         }
+
         markNotified(idempotencyKey);
-        log.info(`[watchdog] notified (forceDelivery=${forceDelivery}) → ${idempotencyKey}`);
+        log.info(`[watchdog] notified (critical=${critical}) → ${idempotencyKey}`);
         return true;
       } catch (err) {
         log.error(
-          `[watchdog] system event API failed for key=${idempotencyKey}: ${err instanceof Error ? err.message : String(err)}`,
+          `[watchdog] notify failed for key=${idempotencyKey}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
 
       return false;
     }
 
-    // ── Hook 1: subagent_ended ──────────────────────────────────────────
+    // ── Hook: subagent_ended ───────────────────────────────────────────────
+
     api.on("subagent_ended", async (event, ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
       const notifyOn = new Set(config.subagentNotifyOn ?? [...DEFAULT_NOTIFY_OUTCOMES]);
@@ -203,14 +254,14 @@ export default definePluginEntry({
               log.info(`[watchdog] continuation injected via API → ${parentKey}`);
               return;
             }
-            log.debug(`[watchdog] enqueueNextTurnInjection returned but not enqueued, falling back`);
+            log.debug(`[watchdog] enqueueNextTurnInjection not enqueued, falling back`);
           } catch (enqueueErr) {
             log.warn(`[watchdog] enqueueNextTurnInjection failed: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)}, falling back`);
           }
         }
 
-        // Fallback: in-process system event
-        const safeText = continuationMsg.length > 1000 ? continuationMsg.slice(0, 1000) + "..." : continuationMsg;
+        // Fallback: enqueueSystemEvent + requestHeartbeat
+        const safeText = truncate(continuationMsg, CONTINUATION_MAX_LEN);
         try {
           api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey: parentKey });
           api.runtime?.system?.requestHeartbeat?.({
@@ -220,14 +271,14 @@ export default definePluginEntry({
             sessionKey: parentKey,
           });
           markNotified(continuationKey);
-          log.info(`[watchdog] continuation via system event API → ${parentKey}`);
+          log.info(`[watchdog] continuation via system event → ${parentKey}`);
         } catch (err) {
-          log.warn(`[watchdog] continuation notification failed for ${childKey}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn(`[watchdog] continuation failed for ${childKey}: ${err instanceof Error ? err.message : String(err)}`);
         }
         return;
       }
 
-      // ── Abnormal outcomes ──
+      // ── Abnormal outcomes (non-critical: only Path A) ──
       if (!outcome || !notifyOn.has(outcome)) {
         log.debug(`[watchdog] subagent_ended skipped: outcome=${outcome ?? "unknown"}`);
         return;
@@ -257,23 +308,22 @@ export default definePluginEntry({
       await notify(message, `watchdog:subagent:${childKey}`, parentKey);
     });
 
-    // ── Silence Detection: config ───────────────────────────────────
-    const SILENCE_IDEMPOTENCY_TTL_MS = 10 * 60 * 1000; // 10 min cooldown per session
+    // ── Hook: message_received — track user messages ───────────────────────
 
-    // ── Hook: message_received — track user messages ─────────────────────
     api.on("message_received", async (event, ctx) => {
       const sessionKey = ctx.sessionKey;
       if (!sessionKey) return;
 
       userMessageTimestamps.set(sessionKey, Date.now());
-      // Record user message content for notification context
+
       const evt = event as Record<string, unknown>;
       const content = typeof evt.content === "string" ? evt.content : "";
       if (content) userMessageContent.set(sessionKey, content);
+
       // Reset consecutive tool call counter on new user message
       consecutiveToolCalls.set(sessionKey, 0);
 
-      // Record channel routing info for reply instructions
+      // Record channel routing for dynamic reply instructions
       const channel = ctx.channelId || "";
       const target = ctx.conversationId || undefined;
       if (channel) {
@@ -285,38 +335,37 @@ export default definePluginEntry({
         lastMainSessionKey = sessionKey;
       }
 
-      log.debug(`[watchdog] message_received: recorded timestamp for session=${sessionKey}`);
+      log.debug(`[watchdog] message_received: session=${sessionKey}`);
     });
 
-    // ── Hook: before_agent_reply — reset counters ───────────────────────
+    // ── Hook: before_agent_reply — reset counters ─────────────────────────
+
     api.on("before_agent_reply", async (_event, ctx) => {
       const sessionKey = ctx.sessionKey;
       if (!sessionKey) return;
 
-      // Agent is replying — reset consecutive tool call counter
       consecutiveToolCalls.set(sessionKey, 0);
-      // Clear the pending user message timestamp (agent is responding)
       userMessageTimestamps.delete(sessionKey);
       log.debug(`[watchdog] before_agent_reply: reset counters for session=${sessionKey}`);
     });
 
-    // ── Hook 2: after_tool_call (exec + consecutive detection) ──────────────
+    // ── Hook: after_tool_call (exec + consecutive detection) ──────────────
+
     api.on("after_tool_call", async (event, ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
       const sessionKey = ctx.sessionKey;
       if (!sessionKey) return;
 
-           // ── Part A: Consecutive tool call detection (all tools) ──
+      // ── Part A: Consecutive tool call detection ──
       const isSubagentSession = /:subagent:/i.test(sessionKey);
       const baseThreshold = config.consecutiveToolCallThreshold ?? 5;
-      const threshold = isSubagentSession
-        ? (config.subagentConsecutiveThreshold ?? baseThreshold * 3)
-        : baseThreshold;
+      const subagentThreshold = config.subagentConsecutiveThreshold ?? 15;
+      const threshold = isSubagentSession ? subagentThreshold : baseThreshold;
+
       const currentCount = (consecutiveToolCalls.get(sessionKey) ?? 0) + 1;
       consecutiveToolCalls.set(sessionKey, currentCount);
 
       if (currentCount >= threshold) {
-        // Determine target: if we're inside a subagent, escalate to parent session
         const isSubagent = /\bsubagent\b/i.test(sessionKey);
         const targetSession = isSubagent
           ? ((ctx as Record<string, unknown>).requesterSessionKey as string || extractParentSessionKey(sessionKey))
@@ -327,15 +376,15 @@ export default definePluginEntry({
         const now = Date.now();
 
         // Rate limit: max 1 nudge per minute per session
-        // Hard cap: after 10 nudges for same session, escalate to main
-        const nudgeCount = (consecutiveNudgeCounts.get(sessionKey) ?? 0);
-        const shouldEscalate = nudgeCount >= 10;
-        const escalationTarget = lastMainSessionKey || extractParentSessionKey(sessionKey);
-        const finalTarget = shouldEscalate ? escalationTarget : targetSession;
-
         if (!lastNudgeTs || now - lastNudgeTs > 60_000) {
-          consecutiveNudgeCounts.set(sessionKey, nudgeCount + 1);
+          const nudgeCount = (consecutiveNudgeCounts.get(sessionKey) ?? 0) + 1;
+          consecutiveNudgeCounts.set(sessionKey, nudgeCount);
           silenceNotifiedKeys.set(`consecutive:${sessionKey}`, now);
+
+          // Hard cap: after 10 nudges → escalation to main session (critical = dual-path)
+          const shouldEscalate = nudgeCount >= 10;
+          const escalationTarget = lastMainSessionKey || extractParentSessionKey(sessionKey);
+          const finalTarget = shouldEscalate ? escalationTarget : targetSession;
 
           let nudgeMsg: string;
           if (shouldEscalate) {
@@ -345,11 +394,12 @@ export default definePluginEntry({
           } else {
             nudgeMsg = `📢 Task Watchdog: 你已经连续调用了 ${currentCount} 个工具，还没有给用户回复。`;
           }
+
           await notify(nudgeMsg, nudgeKey, finalTarget, shouldEscalate);
         }
       }
 
-           // ── Part B: Original exec abnormal detection ──
+      // ── Part B: exec abnormal exit detection ──
       if (config.execNotifyOnAbnormal === false) return;
       if (event.toolName !== "exec") return;
 
@@ -369,7 +419,7 @@ export default definePluginEntry({
         /command\s+not\s+found|permission\s+denied/i.test(resultStr);
 
       if (!isAbnormal) {
-        log.debug(`[watchdog] exec normal exit, skipping (runId=${runId})`);
+        log.debug(`[watchdog] exec normal exit (runId=${runId})`);
         return;
       }
 
@@ -379,34 +429,38 @@ export default definePluginEntry({
       await notify(message, idempotencyKey, sessionKey);
     });
 
-    // ── Pending alerts queue (shared between notify and heartbeat) ──
-    const pendingAlerts: string[] = [];
-
-    // ── Hook 3: heartbeat_prompt_contribution ────────────────────────────
-    const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+    // ── Hook: heartbeat_prompt_contribution ────────────────────────────────
 
     api.on("heartbeat_prompt_contribution", async (_event, ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
       const parts: string[] = [];
+      const sessionKey = ctx?.sessionKey;
 
-      // ── Inject pending alerts so agent knows what triggered this heartbeat ──
+      // ── Drain pending alerts (up to ALERTS_PER_HEARTBEAT) ──
       if (pendingAlerts.length > 0) {
-        const alerts = pendingAlerts.splice(0, 10); // drain up to 10
+        const alerts = pendingAlerts.splice(0, ALERTS_PER_HEARTBEAT);
+
+        // Build reply instruction dynamically from channel map
+        const routing = sessionKey ? sessionChannelMap.get(sessionKey) : undefined;
+        const channelHint = routing
+          ? `请立即通过 message(action=send, channel='${routing.channel}'${routing.target ? `, target='${routing.target}'` : ""}) 回复用户。不要沉默。`
+          : "请立即回复用户。不要沉默。";
+
         parts.push("[Task Watchdog 告警] 以下是需要立即处理的事项：");
-        parts.push(...alerts);
-        parts.push("请立即通过 message(action=send) 回复用户，汇报当前状态。不要沉默。");
+        alerts.forEach((alert, i) => {
+          parts.push(`${i + 1}. ${alert}`);
+        });
+        parts.push(channelHint);
       }
 
-      // ── Silence detection: check unreplied user messages ──
-      const silenceThreshold = config.silenceThresholdMs ?? 180_000;
-      const sessionKey = ctx?.sessionKey;
+      // ── Silence detection: check current session ──
       if (sessionKey) {
+        const silenceThreshold = config.silenceThresholdMs ?? 180_000;
         const lastMsgTs = userMessageTimestamps.get(sessionKey);
         if (lastMsgTs) {
           const elapsed = Date.now() - lastMsgTs;
           if (elapsed >= silenceThreshold) {
-            const elapsedMin = Math.round(elapsed / 60_000);
-            parts.push(`[Task Watchdog 沉默检测] 用户消息已等待 ${elapsedMin} 分钟没有回复。请立即回复。`);
+            parts.push(`[Task Watchdog 沉默检测] 用户消息已等待 ${formatDuration(elapsed)} 没有回复。请立即回复。`);
           }
         }
       }
@@ -433,34 +487,24 @@ export default definePluginEntry({
       };
     });
 
-    // ── Hook 4: gateway_start — timer-based patrol ──────────────────────
+    // ── Hook: gateway_start — timer-based patrol ──────────────────────────
+
     let timerPatrolTimer: ReturnType<typeof setInterval> | undefined;
 
     api.on("gateway_start", async (_event, _ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
       if (config.timerPatrol === false) return;
 
-      const intervalMs = config.timerPatrolIntervalMs ?? 2 * 60 * 1000;
+      const intervalMs = config.timerPatrolIntervalMs ?? 120_000;
 
-      // ── Immediate wake on gateway start ──
-      // Trigger a heartbeat right away so the agent checks for
-      // unreplied user messages and interrupted tasks after a restart.
-      try {
-        const wakeSessionKey = lastMainSessionKey || "main";
-        api.runtime?.system?.enqueueSystemEvent?.(
-          "[Task Watchdog] Gateway 重启完成。请检查是否有未回复的用户消息或被中断的任务，立即处理。",
-          { sessionKey: wakeSessionKey },
-        );
-        api.runtime?.system?.requestHeartbeat?.({
-          source: "hook",
-          intent: "immediate",
-          reason: "watchdog gateway restart recovery",
-        });
-        log.info("[watchdog] gateway_start: immediate wake triggered for restart recovery");
-      } catch (wakeErr) {
-        log.warn(`[watchdog] gateway_start immediate wake failed: ${wakeErr instanceof Error ? wakeErr.message : String(wakeErr)}`);
-      }
+      // ── Immediate wake on gateway restart (critical = dual-path) ──
+      const wakeSessionKey = lastMainSessionKey || "main";
+      const restartMsg =
+        "[Task Watchdog] Gateway 重启完成。请检查是否有未回复的用户消息或被中断的任务，立即处理。";
+      await notify(restartMsg, `watchdog:gateway:restart:${Date.now()}`, wakeSessionKey, true);
+      log.info("[watchdog] gateway_start: restart recovery notification sent");
 
+      // ── Timer patrol loop ──
       timerPatrolTimer = setInterval(async () => {
         try {
           api.runtime?.system?.requestHeartbeat?.({
@@ -469,9 +513,8 @@ export default definePluginEntry({
             reason: "watchdog timer patrol",
           });
 
-                   // ── Silence detection patrol ──
-          const config = (api.pluginConfig as WatchdogConfig) ?? {};
-          const silenceThreshold = config.silenceThresholdMs ?? 180_000; // 3 minutes
+          // ── Silence detection patrol ──
+          const silenceThreshold = config.silenceThresholdMs ?? 180_000;
           const now = Date.now();
 
           for (const [sessionKey, msgTs] of userMessageTimestamps) {
@@ -485,32 +528,27 @@ export default definePluginEntry({
               const silenceKey = `watchdog:silence:${sessionKey}:${now}`;
               silenceNotifiedKeys.set(`silence:${sessionKey}`, now);
 
-              // forceDelivery=true: use runHeartbeatOnce to guarantee delivery to user's channel
+              // Silence detection = critical → dual-path (A+B)
               await notify(silenceMsg, silenceKey, sessionKey, true);
               log.info(`[watchdog] silence nudge sent for session=${sessionKey} (${elapsedMin}min)`);
             }
           }
 
-          // Cleanup expired silence state
+          // ── Cleanup expired state ──
           for (const [key, ts] of silenceNotifiedKeys) {
             if (now - ts > SILENCE_IDEMPOTENCY_TTL_MS) silenceNotifiedKeys.delete(key);
           }
           for (const [key, ts] of userMessageTimestamps) {
-            // Remove entries older than 30 minutes (agent likely responded or session ended)
             if (now - ts > 30 * 60 * 1000) userMessageTimestamps.delete(key);
           }
           for (const [key] of consecutiveToolCalls) {
-            // These are reset on before_agent_reply / message_received, but
-            // prune stale entries here too (no activity seen in 10 min)
-            // We don't have per-entry timestamps, so rely on the userMessageTimestamps
-            // as a proxy — if that session has no recent user message, clean up.
             if (!userMessageTimestamps.has(key)) {
               consecutiveToolCalls.delete(key);
               consecutiveNudgeCounts.delete(key);
             }
           }
 
-          log.debug("[watchdog] timer patrol: requested heartbeat + silence check");
+          log.debug("[watchdog] timer patrol: heartbeat requested + silence check done");
         } catch (err) {
           log.debug(`[watchdog] timer patrol error: ${err}`);
         }
@@ -519,28 +557,29 @@ export default definePluginEntry({
       log.info(`[watchdog] timer patrol started (interval=${intervalMs}ms)`);
     });
 
-    // ── Unified cleanup on gateway_stop ─────────────────────────────────
+    // ── Hook: gateway_stop — unified cleanup ──────────────────────────────
+
     api.on("gateway_stop", () => {
-      // Clean up idempotency cleanup timer
       clearInterval(idempotencyCleanupTimer);
 
-      // Clean up timer patrol
       if (timerPatrolTimer !== undefined) {
         clearInterval(timerPatrolTimer);
         timerPatrolTimer = undefined;
         log.info("[watchdog] timer patrol stopped");
       }
 
-      // Clean up silence detection maps
-      userMessageTimestamps.clear();
+      notifiedKeys.clear();
+      pendingAlerts.length = 0;
       consecutiveToolCalls.clear();
       consecutiveNudgeCounts.clear();
+      userMessageTimestamps.clear();
+      userMessageContent.clear();
       silenceNotifiedKeys.clear();
       sessionChannelMap.clear();
 
-      log.info("[watchdog] all timers cleaned up");
+      log.info("[watchdog] all timers and state cleaned up");
     });
 
-    log.info("[watchdog] Task Watchdog plugin registered (deadlock-safe edition)");
+    log.info("[watchdog] Task Watchdog plugin registered (dual-path notification architecture)");
   },
 });

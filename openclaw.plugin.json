@@ -1,7 +1,7 @@
 {
   "id": "task-watchdog",
   "name": "Task Watchdog",
-  "description": "Injects failure notifications into parent session when subagents fail or exec processes exit abnormally. Uses idempotencyKey to avoid duplicate notifications with OpenClaw's built-in announce delivery.",
+  "description": "Dual-path notification architecture: soft nudge (system event injection) + forced heartbeat delivery for critical alerts. Tracks silence, consecutive tool calls, subagent failures, and exec abnormalities.",
   "activation": {
     "onStartup": true
   },
@@ -60,6 +60,13 @@
         "maximum": 20,
         "default": 5,
         "description": "Number of consecutive tool calls without a reply before triggering a nudge (default 5)"
+      },
+      "subagentConsecutiveThreshold": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 50,
+        "default": 15,
+        "description": "Consecutive tool call threshold for subagent sessions (default 15)"
       },
       "silenceThresholdMs": {
         "type": "integer",
