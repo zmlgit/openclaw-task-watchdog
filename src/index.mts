@@ -121,6 +121,10 @@ export default definePluginEntry({
         const safeText = fullText.length > 1200 ? fullText.slice(0, 1200) + "..." : fullText;
         api.runtime?.system?.enqueueSystemEvent?.(safeText, { sessionKey });
 
+        // Also push to pending alerts so heartbeat_prompt_contribution can inject context
+        pendingAlerts.push(safeText);
+        if (pendingAlerts.length > 20) pendingAlerts.splice(0, pendingAlerts.length - 20);
+
         if (forceDelivery) {
           // Use runHeartbeatOnce with target="last" to force delivery to the user's channel
           // This bypasses the default suppression and ensures the user sees the notification
@@ -363,28 +367,57 @@ export default definePluginEntry({
       await notify(message, idempotencyKey, sessionKey);
     });
 
+    // ── Pending alerts queue (shared between notify and heartbeat) ──
+    const pendingAlerts: string[] = [];
+
     // ── Hook 3: heartbeat_prompt_contribution ────────────────────────────
     const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
-    api.on("heartbeat_prompt_contribution", async (_event, _ctx) => {
+    api.on("heartbeat_prompt_contribution", async (_event, ctx) => {
       const config = (api.pluginConfig as WatchdogConfig) ?? {};
+      const parts: string[] = [];
 
-      // Clear mutual exclusion: heartbeat patrol only when timer patrol is off
+      // ── Inject pending alerts so agent knows what triggered this heartbeat ──
+      if (pendingAlerts.length > 0) {
+        const alerts = pendingAlerts.splice(0, 10); // drain up to 10
+        parts.push("[Task Watchdog 告警] 以下是需要立即处理的事项：");
+        parts.push(...alerts);
+        parts.push("请立即通过 message(action=send) 回复用户，汇报当前状态。不要沉默。");
+      }
+
+      // ── Silence detection: check unreplied user messages ──
+      const silenceThreshold = config.silenceThresholdMs ?? 180_000;
+      const sessionKey = ctx?.sessionKey;
+      if (sessionKey) {
+        const lastMsgTs = userMessageTimestamps.get(sessionKey);
+        if (lastMsgTs) {
+          const elapsed = Date.now() - lastMsgTs;
+          if (elapsed >= silenceThreshold) {
+            const elapsedMin = Math.round(elapsed / 60_000);
+            parts.push(`[Task Watchdog 沉默检测] 用户消息已等待 ${elapsedMin} 分钟没有回复。请立即回复。`);
+          }
+        }
+      }
+
+      // ── Stale task patrol (only when heartbeat patrol is enabled) ──
       const useTimerPatrol = config.timerPatrol !== false;
       const useHeartbeatPatrol =
         config.heartbeatPatrol === true ||
         (!useTimerPatrol && config.heartbeatPatrol !== false);
-      if (!useHeartbeatPatrol) return;
+      if (useHeartbeatPatrol) {
+        const thresholdMin = Math.round(
+          (config.staleThresholdMs ?? STALE_THRESHOLD_MS) / 60_000,
+        );
+        parts.push(
+          `[Task Watchdog 巡检] 检查是否有停滞的后台任务：运行 \`openclaw tasks list --status running --json\`，` +
+          `对 running 超过 ${thresholdMin} 分钟的任务汇报异常。`,
+        );
+      }
 
-      const thresholdMin = Math.round(
-        (config.staleThresholdMs ?? STALE_THRESHOLD_MS) / 60_000,
-      );
+      if (parts.length === 0) return {};
 
       return {
-        appendContext:
-          `[Task Watchdog 巡检] 检查是否有停滞的后台任务：运行 \`openclaw tasks list --status running --json\`，` +
-          `对 running 超过 ${thresholdMin} 分钟的任务汇报异常。` +
-          `如果所有 running 任务都在正常推进，无需额外操作。`,
+        appendContext: parts.join("\n"),
       };
     });
 
