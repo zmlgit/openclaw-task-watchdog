@@ -12,12 +12,16 @@ OpenClaw plugin that auto-notifies on subagent failures, exec errors, and stale 
 ## Install
 
 ```bash
-openclaw plugin install openclaw-task-watchdog
+openclaw plugins install .
 ```
+
+## TweetClaw Companion Use
+
+Use Task Watchdog beside TweetClaw when an OpenClaw session delegates long X/Twitter monitoring, follower export, giveaway draw, or launch-reply analysis work to subagents or shell helpers. TweetClaw handles X/Twitter API actions; Task Watchdog only reports stale sessions, abnormal `exec` exits, and missing parent replies around that work.
 
 ## Config
 
-All optional — works with defaults:
+All optional - works with defaults:
 
 ```json
 {
