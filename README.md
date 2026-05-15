@@ -116,6 +116,8 @@ All settings are optional. Configure via `openclaw.plugin.json` → `config`:
 | `consecutiveToolCallThreshold` | `integer` | `5` | Number of consecutive tool calls without a reply before triggering a nudge (2 to 20) |
 | `subagentConsecutiveThreshold` | `integer` | `15` | Consecutive tool call threshold for subagent sessions. Defaults to `consecutiveToolCallThreshold * 3` if not set |
 | `silenceThresholdMs` | `integer` | `180000` (3 min) | How long after a user message without reply before triggering a silence nudge (60000 to 1800000 ms) |
+| `feishuWebhookUrl` | `string` | `""` | Optional Feishu bot webhook URL for direct delivery |
+| `forceFeishu` | `boolean` | `false` | Also send notifications to Feishu when `feishuWebhookUrl` is configured. System event delivery stays enabled |
 
 Example:
 
@@ -124,10 +126,14 @@ Example:
   "task-watchdog": {
     "subagentNotifyOn": ["error", "timeout", "killed", "reset"],
     "timerPatrolIntervalMs": 180000,
-    "staleThresholdMs": 900000
+    "staleThresholdMs": 900000,
+    "feishuWebhookUrl": "<your-feishu-webhook-url>",
+    "forceFeishu": false
   }
 }
 ```
+
+Leave `forceFeishu` as `false` to use only OpenClaw system-event delivery. Set it to `true` when you want direct Feishu bot delivery as a second path. Feishu webhook failures are logged with `warn` and do not stop the system-event channel.
 
 ## Development
 

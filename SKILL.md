@@ -30,7 +30,11 @@ All optional - works with defaults:
     "execNotifyOnAbnormal": true,
     "timerPatrol": true,
     "timerPatrolIntervalMs": 120000,
-    "staleThresholdMs": 1800000
+    "staleThresholdMs": 1800000,
+    "feishuWebhookUrl": "",
+    "forceFeishu": false
   }
 }
 ```
+
+Set `forceFeishu` to `true` only after adding a Feishu bot webhook URL. Webhook failures are logged with `warn`; normal OpenClaw system-event notifications continue.
