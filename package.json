@@ -3,6 +3,11 @@
   "version": "1.4.0",
   "description": "Watchdog plugin: notify parent agent on subagent failure / exec abnormal exit via next-turn injection",
   "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "pack:dry-run": "npm pack --dry-run --json"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.mjs"

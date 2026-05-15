@@ -74,6 +74,16 @@
         "maximum": 1800000,
         "default": 180000,
         "description": "How long after a user message without reply before triggering a silence nudge (default 3 minutes)"
+      },
+      "feishuWebhookUrl": {
+        "type": "string",
+        "default": "",
+        "description": "Optional Feishu bot webhook URL for direct delivery. Leave empty to use only OpenClaw system events."
+      },
+      "forceFeishu": {
+        "type": "boolean",
+        "default": false,
+        "description": "Also send notifications directly to Feishu when feishuWebhookUrl is configured. System event delivery remains enabled."
       }
     }
   }

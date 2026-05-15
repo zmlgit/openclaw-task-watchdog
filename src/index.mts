@@ -16,6 +16,8 @@ type WatchdogConfig = {
   consecutiveToolCallThreshold?: number;
   subagentConsecutiveThreshold?: number;
   silenceThresholdMs?: number;
+  feishuWebhookUrl?: string;
+  forceFeishu?: boolean;
 };
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -109,6 +111,25 @@ export default definePluginEntry({
       return `已等待 ${formatDuration(elapsed)}`;
     }
 
+    async function notifyViaFeishu(webhookUrl: string, text: string): Promise<void> {
+      try {
+        const response = await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            msg_type: "text",
+            content: { text },
+          }),
+        });
+
+        if (!response.ok) {
+          log.warn(`[watchdog] Feishu webhook returned HTTP ${response.status}`);
+        }
+      } catch (err) {
+        log.warn(`[watchdog] Feishu webhook failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     // ── Idempotency guard ──────────────────────────────────────────────────
 
     const idempotencyCleanupTimer = setInterval(() => {
@@ -144,6 +165,8 @@ export default definePluginEntry({
       sessionKey: string,
       critical: boolean = false,
     ): Promise<boolean> {
+      const config = (api.pluginConfig as WatchdogConfig) ?? {};
+
       if (isNotified(idempotencyKey)) {
         log.debug(`[watchdog] already notified → ${idempotencyKey}`);
         return false;
@@ -180,6 +203,12 @@ export default definePluginEntry({
         pendingAlerts.push(safeText);
         if (pendingAlerts.length > PENDING_ALERTS_MAX) {
           pendingAlerts.splice(0, pendingAlerts.length - PENDING_ALERTS_MAX);
+        }
+
+        // Optional Feishu direct delivery, disabled by default.
+        const feishuWebhookUrl = config.feishuWebhookUrl?.trim();
+        if (config.forceFeishu === true && feishuWebhookUrl) {
+          await notifyViaFeishu(feishuWebhookUrl, safeText);
         }
 
         // ── Path B: forced delivery for critical alerts ──
